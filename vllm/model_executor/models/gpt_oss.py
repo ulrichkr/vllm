@@ -28,7 +28,7 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 from vllm.utils import cdiv
 
-from .interfaces import SupportsPP
+from .interfaces import SupportsEagle3, SupportsPP
 from .utils import (AutoWeightsLoader, WeightsMapper, extract_layer_index,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
@@ -223,7 +223,7 @@ class GptOssModel(nn.Module):
         self.quant_config = vllm_config.quant_config
         self.parallel_config = vllm_config.parallel_config
         self.config.hidden_size = self.config.hidden_size
-        self.embedding = VocabParallelEmbedding(
+        self.embed_tokens = VocabParallelEmbedding(
             self.config.vocab_size,
             self.config.hidden_size,
         )
@@ -241,9 +241,10 @@ class GptOssModel(nn.Module):
         self.make_empty_intermediate_tensors = (
             make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"], self.config.hidden_size))
+        self.aux_hidden_state_layers: tuple[int] = tuple()
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embedding(input_ids)
+        return self.embed_tokens(input_ids)
 
     def forward(
         self,
@@ -264,8 +265,11 @@ class GptOssModel(nn.Module):
             x = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
+            if i in self.aux_hidden_state_layers:
+                aux_hidden_states.append(x + residual)
             x, residual = layer(x, positions, residual)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
@@ -273,6 +277,8 @@ class GptOssModel(nn.Module):
                 "residual": residual
             })
         x, _ = self.norm(x, residual)
+        if len(aux_hidden_states) > 0:
+            return x, aux_hidden_states
         return x
 
     def _load_weights_mxfp4(
@@ -613,7 +619,7 @@ class GptOssModel(nn.Module):
                                             weights, stacked_params_mapping)
 
 
-class GptOssForCausalLM(nn.Module, SupportsPP):
+class GptOssForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     packed_modules_mapping = {"qkv": ["q_proj", "k_proj", "v_proj"]}
 
     hf_to_vllm_mapper = WeightsMapper(
@@ -621,8 +627,6 @@ class GptOssForCausalLM(nn.Module, SupportsPP):
             ".self_attn.": ".attn.",
         },
         orig_to_new_suffix={
-            ".embed_tokens.weight": ".embedding.weight",
-
             # MoE MXFP4 weights
             ".gate_up_proj_blocks": ".w13_weight",
             ".down_proj_blocks": ".w2_weight",
@@ -662,6 +666,13 @@ class GptOssForCausalLM(nn.Module, SupportsPP):
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int]) -> None:
+        self.model.aux_hidden_state_layers = layers
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int]:
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
 
     def forward(self,
                 input_ids: torch.Tensor,
