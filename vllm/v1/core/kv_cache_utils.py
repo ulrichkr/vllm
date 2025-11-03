@@ -887,6 +887,50 @@ def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bo
     return not kv_cache_spec
 
 
+def _get_kv_cache_groups_uniform_page_size_with_speculator_fix(
+    kv_cache_spec: dict[str, KVCacheSpec],
+    speculator_layers: list[str],
+) -> list[KVCacheGroupSpec]:
+    """
+    Special version of uniform page size grouping that keeps speculator layers together.
+    """
+    # Group all layers by kv_cache_spec.
+    same_type_layers: dict[KVCacheSpec, list[str]] = defaultdict(list)
+    for layer_name, layer_spec in kv_cache_spec.items():
+        same_type_layers[layer_spec].append(layer_name)
+
+    # Find speculator spec and keep those layers together
+    speculator_spec = None
+    for spec, layers in same_type_layers.items():
+        if any(layer in speculator_layers for layer in layers):
+            speculator_spec = spec
+            break
+    
+    grouped_layers = []
+    
+    # Keep all speculator layers in one group
+    if speculator_spec is not None:
+        speculator_spec_layers = same_type_layers[speculator_spec]
+        logger.info("Keeping speculator layers together in one group: %s", speculator_spec_layers)
+        grouped_layers.append(speculator_spec_layers)
+        
+        # Process remaining non-speculator layers with original logic
+        remaining_layers_by_spec = {spec: layers for spec, layers in same_type_layers.items() 
+                                   if spec != speculator_spec}
+    else:
+        remaining_layers_by_spec = same_type_layers
+    
+    # Process remaining layers with original logic if any
+    if remaining_layers_by_spec:
+        group_size = min([len(layers) for layers in remaining_layers_by_spec.values()])
+        for layers in remaining_layers_by_spec.values():
+            num_groups = cdiv(len(layers), group_size)
+            for i in range(num_groups):
+                grouped_layers.append(layers[i::num_groups])
+    
+    return create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
+
+
 def _get_kv_cache_groups_uniform_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
@@ -959,42 +1003,52 @@ def _get_kv_cache_groups_uniform_page_size(
     for layer_name, layer_spec in kv_cache_spec.items():
         same_type_layers[layer_spec].append(layer_name)
 
-    # Split each group into smaller groups, to make the number of layers in each
-    # group identical. Add padding to the last group of each type if necessary.
-    # E.g., (full.0, full.1), (sw.0, sw.1, sw.2)
-    # split to 3 groups with 2 layers each:
-    # (full.0, full.1), (sw.0, sw.2), (sw.1, padding).
-    # FIXME(Chen): At the moment of writing this code (2025-06-02), all
-    # open-source hybrid model follows a n:1 pattern between different attention
-    # types (e.g., Gemma3 5:1 between sw and full, LLaMA4 3:1 between local and
-    # full), so we can use the "1" in the n:1 pattern as the group size, which
-    # is the minimum number of layers among all attention types. Need a better
-    # strategy if we want to support more complex patterns (e.g., 20 full + 30
-    # sw, where the group size should be 10).
-    group_size = min([len(layers) for layers in same_type_layers.values()])
+    # Debug: Log all layer groups to understand the structure
+    logger.info("KV cache layer grouping - found %d different specs:", len(same_type_layers))
+    for i, (spec, layers) in enumerate(same_type_layers.items()):
+        logger.info("  Spec %d (%d layers): %s", i, len(layers), layers[:3] + ['...'] if len(layers) > 3 else layers)
+    
     grouped_layers = []
-    for layers in same_type_layers.values():
-        num_padding_layers = group_size - len(layers) % group_size
-        if num_padding_layers != group_size:
-            logger.warning(
-                "Add %d padding layers, may waste at most %.2f%% KV cache memory",  # noqa
-                num_padding_layers,
-                num_padding_layers / len(layers) * 100,
-            )
-        num_groups = cdiv(len(layers), group_size)
-        # In PP case, say if we have
-        # - stage 0: full.0, sw.0, sw.1
-        # - stage 1: full.1, sw.2, sw.3
-        # We should have 3 groups: (full.0, full.1), (sw.0, sw.2), (sw.1, sw.3)
-        # It can't be (full.0, full.1), (sw.0, sw.1), (sw.2, sw.3) because
-        # the 3 groups in stage 0 will be (full.0), (sw.0, sw.1), (empty group)
-        # and it will be padded to (full.0, padding), (sw.0, sw.1),
-        # (padding, padding) to ensure the number of layers in each group is
-        # the same and will cause memory waste.
-        # To avoid this, we assign layers[i::num_groups] to the i-th group
-        # instead of layers[i * group_size: (i + 1) * group_size]
-        for i in range(num_groups):
-            grouped_layers.append(layers[i::num_groups])
+    remaining_layers_by_spec = same_type_layers
+    
+    # Process non-EAGLE layers with the original logic
+    if remaining_layers_by_spec:
+        # Split each group into smaller groups, to make the number of layers in each
+        # group identical. Add padding to the last group of each type if necessary.
+        # E.g., (full.0, full.1), (sw.0, sw.1, sw.2)
+        # split to 3 groups with 2 layers each:
+        # (full.0, full.1), (sw.0, sw.2), (sw.1, padding).
+        # FIXME(Chen): At the moment of writing this code (2025-06-02), all
+        # open-source hybrid model follows a n:1 pattern between different attention
+        # types (e.g., Gemma3 5:1 between sw and full, LLaMA4 3:1 between local and
+        # full), so we can use the "1" in the n:1 pattern as the group size, which
+        # is the minimum number of layers among all attention types. Need a better
+        # strategy if we want to support more complex patterns (e.g., 20 full + 30
+        # sw, where the group size should be 10).
+        group_size = min([len(layers) for layers in remaining_layers_by_spec.values()])
+        for layers in remaining_layers_by_spec.values():
+            num_padding_layers = group_size - len(layers) % group_size
+            if num_padding_layers != group_size:
+                logger.warning(
+                    "Add %d padding layers, may waste at most %.2f%% KV cache memory",  # noqa
+                    num_padding_layers,
+                    num_padding_layers / len(layers) * 100,
+                )
+            num_groups = cdiv(len(layers), group_size)
+            # In PP case, say if we have
+            # - stage 0: full.0, sw.0, sw.1
+            # - stage 1: full.1, sw.2, sw.3
+            # We should have 3 groups: (full.0, full.1), (sw.0, sw.2), (sw.1, sw.3)
+            # It can't be (full.0, full.1), (sw.0, sw.1), (sw.2, sw.3) because
+            # the 3 groups in stage 0 will be (full.0), (sw.0, sw.1), (empty group)
+            # and it will be padded to (full.0, padding), (sw.0, sw.1),
+            # (padding, padding) to ensure the number of layers in each group is
+            # the same and will cause memory waste.
+            # To avoid this, we assign layers[i::num_groups] to the i-th group
+            # instead of layers[i * group_size: (i + 1) * group_size]
+            for i in range(num_groups):
+                grouped_layers.append(layers[i::num_groups])
+    
     return create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
 
 
@@ -1137,6 +1191,16 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
         )
 
 
+def _identify_speculator_layers(vllm_config: VllmConfig, layer_names: list[str]) -> list[str]:
+    """Identify speculator layers programmatically."""
+    if not vllm_config.speculative_config or not vllm_config.speculative_config.use_eagle():
+        return []
+    
+    # For EAGLE, speculator layers typically use 'self_attn' instead of 'attn'
+    speculator_layers = [name for name in layer_names if 'self_attn' in name]
+    return speculator_layers
+
+
 def get_kv_cache_groups(
     vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
 ) -> list[KVCacheGroupSpec]:
@@ -1150,8 +1214,20 @@ def get_kv_cache_groups(
     Returns:
         The generated KVCacheGroups
     """
+    layer_names = list(kv_cache_spec.keys())
+    logger.info("get_kv_cache_groups called with %d layers: %s", len(layer_names), layer_names)
+    
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         unify_hybrid_kv_cache_specs(kv_cache_spec)
+
+    # Special handling for speculative decoding: detect speculator layers that need to stay together
+    speculator_layers = _identify_speculator_layers(vllm_config, layer_names)
+    
+    if speculator_layers:
+        logger.info("DETECTED SPECULATOR LAYERS - will use hybrid grouping: %s", speculator_layers)
+        if not is_kv_cache_page_size_uniform(kv_cache_spec):
+            logger.warning("Speculator layers detected but page sizes not uniform - this may cause issues")
+        return _get_kv_cache_groups_uniform_page_size_with_speculator_fix(kv_cache_spec, speculator_layers)
 
     if is_kv_cache_type_attention_free(kv_cache_spec):
         # This returns an empty list to allow for the KVCacheManager to handle

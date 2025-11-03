@@ -183,6 +183,6 @@ class EagleLlamaForCausalLM(LlamaForCausalLM):
 
         loader = AutoWeightsLoader(
             self,
-            skip_prefixes=None,
+            skip_prefixes=["lm_head."],
         )
         loader.load_weights(map(transform, weights))
