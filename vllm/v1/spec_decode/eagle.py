@@ -1119,17 +1119,33 @@ class EagleProposer:
         for id, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
             for layer_name in kv_cache_group.layer_names:
                 kv_cache_groups[layer_name] = id
-        assert (
-            len(
-                set(
-                    [
-                        kv_cache_groups[layer_name]
-                        for layer_name in self.attn_layer_names
-                    ]
-                )
+        
+        eagle_groups = set(
+            kv_cache_groups[layer_name]
+            for layer_name in self.attn_layer_names
+            if layer_name in kv_cache_groups
+        )
+        
+        if len(eagle_groups) != 1:
+            # Collect detailed information for debugging
+            group_details = {}
+            for layer_name in self.attn_layer_names:
+                if layer_name in kv_cache_groups:
+                    group_id = kv_cache_groups[layer_name]
+                    if group_id not in group_details:
+                        group_details[group_id] = []
+                    group_details[group_id].append(layer_name)
+            
+            error_msg = (
+                f"All EAGLE layers must belong to the same KV cache group, "
+                f"but found layers in {len(eagle_groups)} different groups:\n"
             )
-            == 1
-        ), "All eagle layers should belong to the same kv cache group"
+            for group_id, layers in group_details.items():
+                error_msg += f"  Group {group_id}: {layers}\n"
+            error_msg += f"Total EAGLE layers: {self.attn_layer_names}\n"
+            error_msg += f"Total KV cache groups: {len(kv_cache_config.kv_cache_groups)}"
+            
+            raise AssertionError(error_msg)
 
 
 # NOTE(woosuk): Currently, the below code is not used and we always use argmax
