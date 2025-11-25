@@ -50,19 +50,27 @@ class EAGLEConfig(PretrainedConfig):
                 for arch in self.model.architectures
             ]
 
-        elif method == "eagle3":
+        elif method in ("eagle3", "eagle3_adjusted"):
             assert self.model is not None, (
-                "model should not be None when method is eagle3"
+                f"model should not be None when method is {method}"
             )
-            kwargs["architectures"] = [
-                arch
-                if arch.startswith("Eagle3") or arch.endswith("Eagle3")
-                else f"Eagle3{arch}"
-                for arch in self.model.architectures
-            ]
+            if method == "eagle3_adjusted":
+                kwargs["architectures"] = [
+                    arch
+                    if arch.startswith("Eagle3Adjusted") or arch.endswith("Eagle3Adjusted")
+                    else f"Eagle3Adjusted{arch}"
+                    for arch in self.model.architectures
+                ]
+            else:  # eagle3
+                kwargs["architectures"] = [
+                    arch
+                    if arch.startswith("Eagle3") or arch.endswith("Eagle3")
+                    else f"Eagle3{arch}"
+                    for arch in self.model.architectures
+                ]
         else:
             raise ValueError(
-                f"Invalid method {method}. Supported methods are eagle and eagle3."
+                f"Invalid method {method}. Supported methods are eagle, eagle3, and eagle3_adjusted."
             )
 
         super().__init__(**kwargs)

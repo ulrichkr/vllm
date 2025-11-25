@@ -38,7 +38,7 @@ MTPModelTypes = Literal[
     "mtp",
     "pangu_ultra_moe_mtp",
 ]
-EagleModelTypes = Literal["eagle", "eagle3", MTPModelTypes]
+EagleModelTypes = Literal["eagle", "eagle3", "eagle3_adjusted", MTPModelTypes]
 SpeculativeMethod = Literal[
     "ngram",
     "medusa",
@@ -161,7 +161,7 @@ class SpeculativeConfig:
         factors: list[Any] = []
         # Eagle3 affects the computation graph because it returns intermediate
         # hidden states in addition to the final hidden state.
-        factors.append(self.method == "eagle3")
+        factors.append(self.method in ("eagle3", "eagle3_adjusted"))
         hash_str = hashlib.md5(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
 
@@ -336,7 +336,7 @@ class SpeculativeConfig:
                 )
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3"):
+                if self.method in ("eagle", "eagle3", "eagle3_adjusted"):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -344,6 +344,8 @@ class SpeculativeConfig:
                 # AngelSlim/Qwen3-8B_eagle3
                 elif "eagle-" in self.draft_model_config.model.lower():
                     self.method = "eagle"
+                elif "eagle3_adjusted" in self.draft_model_config.model.lower():
+                    self.method = "eagle3_adjusted"
                 elif "eagle3" in self.draft_model_config.model.lower():
                     self.method = "eagle3"
                 elif self.draft_model_config.hf_config.model_type == "medusa":
@@ -380,7 +382,7 @@ class SpeculativeConfig:
                     )
 
                 # Replace hf_config for EAGLE draft_model
-                if self.method in ("eagle", "eagle3"):
+                if self.method in ("eagle", "eagle3", "eagle3_adjusted"):
                     from vllm.transformers_utils.configs import SpeculatorsConfig
                     from vllm.transformers_utils.configs.eagle import EAGLEConfig
 
@@ -615,7 +617,7 @@ class SpeculativeConfig:
 
         eagle3_target_supported = ["llama", "qwen", "minicpm", "gpt_oss"]
         if (
-            self.method == "eagle3"
+            self.method in ("eagle3", "eagle3_adjusted")
             and self.target_model_config
             and not any(
                 supported_model in self.target_model_config.hf_text_config.model_type
@@ -630,7 +632,7 @@ class SpeculativeConfig:
         return self
 
     def use_eagle(self) -> bool:
-        return self.method in ("eagle", "eagle3", "mtp")
+        return self.method in ("eagle", "eagle3", "eagle3_adjusted", "mtp")
 
     def __repr__(self) -> str:
         method = self.method
